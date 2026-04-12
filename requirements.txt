@@ -1,0 +1,9 @@
+streamlit
+python-dotenv
+spacy
+sentence-transformers
+scikit-learn
+numpy
+google-generativeai
+networkx
+matplotlib
