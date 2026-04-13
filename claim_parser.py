@@ -20,6 +20,15 @@ def is_dependent(claim_text: str) -> bool:
     return bool(re.search(pattern, claim_text, re.IGNORECASE))
 
 
+def check_advancement(claim_text: str) -> bool:
+    """
+    Detect whether a claim mentions technical advancement, economical benefits,
+    or resource usage optimizations (e.g., less cost, efficiency).
+    """
+    pattern = r"\b(technical advancement|economical|less cost|less costing|reduced cost|resource usage|efficiency|efficient|improve|improved|optimization|optimized|savings?|faster|cheaper|reduction)\b"
+    return bool(re.search(pattern, claim_text, re.IGNORECASE))
+
+
 def extract_components_functions(claim_text: str) -> dict:
     """
     Use spaCy NLP to extract:
@@ -82,6 +91,7 @@ def parse_claim(claim_text: str) -> dict:
         {
             "text": str,
             "dependent": bool,
+            "has_advancement": bool,
             "components": List[str],
             "functions": List[str],
             "relations": List[tuple],
@@ -92,6 +102,7 @@ def parse_claim(claim_text: str) -> dict:
     return {
         "text": claim_text,
         "dependent": is_dependent(claim_text),
+        "has_advancement": check_advancement(claim_text),
         "components": parsed["components"],
         "functions": parsed["functions"],
         "relations": parsed["relations"],

@@ -70,6 +70,7 @@ def decide_inventiveness(
     )
     has_new_components = len(comparison["new_components"]) > 0
     high_sim = best_match["similarity"] >= HIGH_SIMILARITY_THRESHOLD
+    has_advancement = invention_claim.get("has_advancement", False)
 
     # --- Decision tree ---
     if (
@@ -77,12 +78,21 @@ def decide_inventiveness(
         and func_overlap_ratio >= FUNCTION_OVERLAP_RATIO_THRESHOLD
         and high_sim
     ):
-        verdict = "NOT INVENTIVE"
-        reason = (
-            f"High semantic similarity ({best_match['similarity']:.2f}) with {best_match['patent_id']}. "
-            f"{int(comp_overlap_ratio*100)}% component overlap and "
-            f"{int(func_overlap_ratio*100)}% function overlap detected."
-        )
+        if has_advancement:
+            verdict = "WEAK INVENTIVE"
+            reason = (
+                f"High semantic similarity ({best_match['similarity']:.2f}) with {best_match['patent_id']}. "
+                f"{int(comp_overlap_ratio*100)}% component overlap and "
+                f"{int(func_overlap_ratio*100)}% function overlap detected, "
+                f"but claim explicitly mentions technical/economical advancement."
+            )
+        else:
+            verdict = "NOT INVENTIVE"
+            reason = (
+                f"High semantic similarity ({best_match['similarity']:.2f}) with {best_match['patent_id']}. "
+                f"{int(comp_overlap_ratio*100)}% component overlap and "
+                f"{int(func_overlap_ratio*100)}% function overlap detected."
+            )
 
     elif (
         comp_overlap_ratio >= COMPONENT_OVERLAP_RATIO_THRESHOLD
