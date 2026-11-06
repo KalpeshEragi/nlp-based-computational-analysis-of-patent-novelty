@@ -85,6 +85,25 @@ class CPCClassifier(nn.Module):
         return self.head(pooled)
 
 
+class AsymmetricLoss(nn.Module):
+    """
+    Asymmetric Loss (Ridnik et al., 2021) for multi-label problems where most
+    labels are negative: easy negatives are down-weighted (gamma_neg) and very
+    low-probability negatives are ignored (clip).
+    """
+
+    def __init__(self, gamma_neg=4.0, gamma_pos=0.0, clip=0.05, eps=1e-8):
+        super().__init__()
+        self.gn, self.gp, self.clip, self.eps = gamma_neg, gamma_pos, clip, eps
+
+    def forward(self, logits, y):
+        p = torch.sigmoid(logits)
+        p_neg = (p - self.clip).clamp(min=0) if self.clip else p
+        loss_pos = y * torch.log(p.clamp(min=self.eps)) * (1 - p) ** self.gp
+        loss_neg = (1 - y) * torch.log((1 - p_neg).clamp(min=self.eps)) * p_neg ** self.gn
+        return -(loss_pos + loss_neg).sum(1).mean()
+
+
 # ----------------------------------------------------------------------------
 # Metrics
 # ----------------------------------------------------------------------------
@@ -100,6 +119,9 @@ def compute_metrics(logits: np.ndarray, y: np.ndarray, mains: np.ndarray) -> dic
     for k in (1, 3, 5):
         topk = order[:, :k]
         m[f"top{k}_acc"] = float(np.mean([mn >= 0 and mn in row for mn, row in zip(mains, topk)]))
+    for k in (1, 3, 5):
+        # any_hit@k: at least one true subclass in the top k (how Layer 1 uses it)
+        m[f"any_hit@{k}"] = float(np.mean(np.take_along_axis(y, order[:, :k], axis=1).max(1) > 0))
     top5 = order[:, :5]
     hits = np.take_along_axis(y, top5, axis=1).sum(1)
     m["recall@5"] = float(np.sum(hits) / max(np.sum(y), 1))
@@ -130,6 +152,17 @@ def evaluate(model, loader, device, amp):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true", help="use *_quick.parquet files")
+    ap.add_argument("--train-files", nargs="*",
+                    help="train parquet files (default: data/train.parquet)")
+    ap.add_argument("--data-dir", default=str(DATA_DIR),
+                    help="folder holding val/test parquet files")
+    ap.add_argument("--cpc-only", action="store_true",
+                    help="drop rows whose labels came from the IPC fallback")
+    ap.add_argument("--init-from", help="folder with model.pt + labels.json to keep training")
+    ap.add_argument("--loss", choices=["bce", "asl"], default="bce")
+    ap.add_argument("--patience", type=int, default=1,
+                    help="early stopping: epochs without val improvement")
+    ap.add_argument("--warmup", type=float, default=0.06)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--grad-accum", type=int, default=2)
@@ -142,16 +175,25 @@ def main():
     ap.add_argument("--out", default=str(Path(__file__).parent / "model"))
     args = ap.parse_args()
 
+    data_dir = Path(args.data_dir)
     suffix = "_quick" if args.quick else ""
     if args.quick:
         args.min_count = min(args.min_count, 3)
-    train_df = pd.read_parquet(DATA_DIR / f"train{suffix}.parquet")
-    val_df = pd.read_parquet(DATA_DIR / f"val{suffix}.parquet")
-    test_df = pd.read_parquet(DATA_DIR / f"test{suffix}.parquet")
+    train_files = args.train_files or [data_dir / f"train{suffix}.parquet"]
+    train_df = pd.concat([pd.read_parquet(f) for f in train_files], ignore_index=True)
+    train_df = train_df.drop_duplicates("application_number")
+    if args.cpc_only:
+        train_df = train_df[train_df["label_source"] == "cpc"]
+    val_df = pd.read_parquet(data_dir / f"val{suffix}.parquet")
+    test_df = pd.read_parquet(data_dir / f"test{suffix}.parquet")
     if args.max_train:
         train_df = train_df.sample(min(args.max_train, len(train_df)), random_state=0)
 
-    labels = build_label_space(train_df, args.min_count)
+    init = Path(args.init_from) if args.init_from else None
+    if init:
+        labels = json.loads((init / "labels.json").read_text())  # keep v1 label space
+    else:
+        labels = build_label_space(train_df, args.min_count)
     print(f"train={len(train_df)} val={len(val_df)} test={len(test_df)} labels={len(labels)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -166,19 +208,35 @@ def main():
 
     train_dl, val_dl, test_dl = loader(train_df, True), loader(val_df, False), loader(test_df, False)
 
-    model = CPCClassifier(len(labels)).to(device)
+    base = CPCClassifier(len(labels))
+    if init:
+        base.load_state_dict(torch.load(init / "model.pt", map_location="cpu"))
+        print(f"warm start from {init}")
+    base.to(device)
+    # use every visible GPU (Kaggle T4 x2); each batch is split across them
+    model = nn.DataParallel(base) if torch.cuda.device_count() > 1 else base
+    print(f"GPUs used: {torch.cuda.device_count()}")
+
     optim = torch.optim.AdamW([
-        {"params": model.encoder.parameters(), "lr": args.lr},
-        {"params": model.head.parameters(), "lr": args.head_lr},
+        {"params": base.encoder.parameters(), "lr": args.lr},
+        {"params": base.head.parameters(), "lr": args.head_lr},
     ], weight_decay=0.01)
     steps = math.ceil(len(train_dl) / args.grad_accum) * args.epochs
-    sched = get_linear_schedule_with_warmup(optim, int(0.06 * steps), steps)
+    sched = get_linear_schedule_with_warmup(optim, int(args.warmup * steps), steps)
     scaler = torch.amp.GradScaler(enabled=amp)
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = AsymmetricLoss() if args.loss == "asl" else nn.BCEWithLogitsLoss()
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    best, history = -1.0, []
+    best, history, bad_epochs = -1.0, [], 0
+
+    if init:
+        # score the starting model so v2 only replaces it if it really improves
+        val_m = evaluate(model, val_dl, device, amp)
+        history.append({"epoch": 0, **val_m})
+        print(f"[epoch 0 / start] val {json.dumps(val_m)}", flush=True)
+        best = val_m["recall@5"]
+        torch.save(base.state_dict(), out / "model.pt")
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -186,11 +244,12 @@ def main():
         for step, (enc, y, _) in enumerate(train_dl, 1):
             enc = {k: v.to(device) for k, v in enc.items()}
             with torch.autocast(device_type=device.type, enabled=amp):
-                loss = loss_fn(model(**enc).float(), y.to(device)) / args.grad_accum
+                logits = model(**enc)
+            loss = loss_fn(logits.float(), y.to(device)) / args.grad_accum
             scaler.scale(loss).backward()
             if step % args.grad_accum == 0 or step == len(train_dl):
                 scaler.unscale_(optim)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(base.parameters(), 1.0)
                 scaler.step(optim)
                 scaler.update()
                 optim.zero_grad(set_to_none=True)
@@ -206,18 +265,26 @@ def main():
 
         # best checkpoint chosen by recall@5 (what Layer 1 filtering depends on)
         if val_m["recall@5"] > best:
-            best = val_m["recall@5"]
-            torch.save(model.state_dict(), out / "model.pt")
+            best, bad_epochs = val_m["recall@5"], 0
+            torch.save(base.state_dict(), out / "model.pt")
             print(f"  saved best (recall@5={best:.4f})", flush=True)
+        else:
+            bad_epochs += 1
+            print(f"  no improvement ({bad_epochs}/{args.patience})", flush=True)
+            if bad_epochs >= args.patience:
+                print("  early stopping", flush=True)
+                break
 
-    model.load_state_dict(torch.load(out / "model.pt", map_location=device))
+    base.load_state_dict(torch.load(out / "model.pt", map_location=device))
     test_m = evaluate(model, test_dl, device, amp)
     print(f"[test] {json.dumps(test_m)}", flush=True)
 
     tok.save_pretrained(out)
     (out / "labels.json").write_text(json.dumps(labels))
+    args_out = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    args_out["train_files"] = [str(f) for f in train_files]
     (out / "metrics.json").write_text(json.dumps(
-        {"args": vars(args), "n_labels": len(labels), "history": history, "test": test_m},
+        {"args": args_out, "n_labels": len(labels), "history": history, "test": test_m},
         indent=2))
     print(f"saved model, labels and metrics to {out}")
 

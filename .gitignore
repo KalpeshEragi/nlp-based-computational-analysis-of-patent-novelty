@@ -3,3 +3,4 @@ __pycache__/
 venv/
 outputs/cpc_classifier/data/
 cpc_classifier/model/
+cpc_classifier/model_v2test/

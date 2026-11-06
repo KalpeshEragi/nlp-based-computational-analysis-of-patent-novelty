@@ -85,7 +85,8 @@ def parse_record(d: dict, year: int) -> dict | None:
     }
 
 
-def stream_year(year: int, limit: int, keep_prob: float, seed: int) -> list[dict]:
+def stream_year(year: int, limit: int, keep_prob: float, seed: int,
+                exclude: set | None = None, cpc_only: bool = False) -> list[dict]:
     """Stream one year's tar.gz and collect up to `limit` usable records."""
     rng = random.Random(seed + year)
     rows, seen = [], 0
@@ -104,7 +105,11 @@ def stream_year(year: int, limit: int, keep_prob: float, seed: int) -> list[dict
                     d = json.load(tar.extractfile(member))
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
+                if exclude and d.get("application_number") in exclude:
+                    continue
                 rec = parse_record(d, year)
+                if rec and cpc_only and rec["label_source"] != "cpc":
+                    continue
                 if rec:
                     rows.append(rec)
                 if len(rows) % 2000 == 0 and rows:
@@ -124,7 +129,28 @@ def main():
     ap.add_argument("--quick", action="store_true",
                     help="tiny run to test the pipeline")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--extra", metavar="EXISTING_TRAIN_PARQUET",
+                    help="only build train_extra.parquet with NEW patents, "
+                         "skipping application numbers already in this file")
+    ap.add_argument("--extra-years", default="2013,2014,2015")
+    ap.add_argument("--extra-per-year", type=int, default=34000)
     args = ap.parse_args()
+
+    if args.extra:
+        # Fast v2: new CPC-labelled patents only; val/test stay unchanged so
+        # scores remain comparable with v1.
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        seen = set(pd.read_parquet(args.extra, columns=["application_number"])
+                   ["application_number"])
+        rows = []
+        for y in map(int, args.extra_years.split(",")):
+            rows += stream_year(y, args.extra_per_year, args.keep_prob,
+                                args.seed, exclude=seen, cpc_only=True)
+        df = pd.DataFrame(rows)
+        path = OUT_DIR / "train_extra.parquet"
+        df.to_parquet(path, index=False)
+        print(f"==> train_extra: {len(df)} rows -> {path}", flush=True)
+        return
 
     if args.quick:
         args.per_year_train, args.per_year_eval = 500, 300
