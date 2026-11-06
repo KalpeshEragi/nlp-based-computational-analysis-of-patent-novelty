@@ -1,4 +1,5 @@
 .env
 __pycache__/
 venv/
-outputs/
+outputs/cpc_classifier/data/
+cpc_classifier/model/
