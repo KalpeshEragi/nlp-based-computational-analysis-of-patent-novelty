@@ -9,3 +9,5 @@ retrieval/index_small/
 eval/data/
 eval/results/
 analysis/outcome_model/
+out/
+hf_data/
