@@ -41,14 +41,26 @@ def bm25_texts(df: pd.DataFrame) -> list[str]:
     return (df["title"] + " " + df["abstract"] + " " + df["independent_claims"]).tolist()
 
 
+def build_bm25(df: pd.DataFrame, idx: Path):
+    retriever = bm25s.BM25()
+    retriever.index(bm25s.tokenize(bm25_texts(df), stopwords="en", show_progress=False))
+    retriever.save(idx / "bm25")
+    print("==> bm25 index saved", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index", default="retrieval/index")
     ap.add_argument("--batch-size", type=int, default=128)
+    ap.add_argument("--bm25-only", action="store_true",
+                    help="rebuild only the keyword index (vectors already exist)")
     args = ap.parse_args()
 
     idx = Path(args.index)
     df = pd.read_parquet(idx / "corpus.parquet")
+    if args.bm25_only:
+        build_bm25(df, idx)
+        return
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = SentenceTransformer(EMBED_MODEL, device=device)
     if device == "cuda":
@@ -65,10 +77,7 @@ def main():
 
     np.save(idx / "has_summary.npy", (df["summary"].fillna("").str.len() > 50).to_numpy())
 
-    retriever = bm25s.BM25()
-    retriever.index(bm25s.tokenize(bm25_texts(df), stopwords="en", show_progress=False))
-    retriever.save(idx / "bm25")
-    print("==> bm25 index saved", flush=True)
+    build_bm25(df, idx)
 
     (idx / "meta.json").write_text(json.dumps(
         {"embed_model": EMBED_MODEL, "fields": FIELDS, "n_patents": len(df)}, indent=2))
