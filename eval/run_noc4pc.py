@@ -67,8 +67,7 @@ def main():
     if out.exists():
         done = {(r["app"], r["claim"]) for r in map(json.loads, out.open())}
 
-    analyzer = Analyzer()
-    checker = analyzer.checker
+    analyzer = Analyzer(outcome_model=None)   # never use a trained model while generating data
     t0, n = time.time(), 0
     with out.open("a") as fh:
         for _, row in df.iterrows():
@@ -82,16 +81,17 @@ def main():
                                   "", claims_text)
             refs = {r["patent_id"]: ref_doc(r) for r in json.loads(row.prior_art_specifications)}
             answer = json.loads(row.answer)
-            checker.records = []
             try:
                 res = analyzer.analyze(doc, prior_art={"all": list(refs)}, prior_art_docs=refs,
-                                       only_claims=[key[1]])
+                                       only_claims=[key[1]], keep_inputs=True)
                 c = res["claims"][0]
+                inp = c["outcome_inputs"]
                 rec = {"app": key[0], "claim": key[1], "label": LABEL[answer["code"]],
                        "pred": c["verdict"], "novelty_score": c["novelty_score"],
                        "inventive_score": c["inventive_score"],
                        "n_features": len(c["feature_chart"]), "refs": list(refs),
-                       "signals": checker.records, "linked_effects": len(c["linked_effects"])}
+                       "signals": inp["signals"], "info": inp["info"],
+                       "linked_effects": len(c["linked_effects"])}
             except Exception as e:  # keep going; failures are counted in the metrics
                 rec = {"app": key[0], "claim": key[1], "label": LABEL[answer["code"]],
                        "pred": None, "error": repr(e)[:300]}

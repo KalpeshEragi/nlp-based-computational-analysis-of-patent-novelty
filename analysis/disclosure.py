@@ -158,7 +158,8 @@ class DisclosureChecker:
             comp_found = bool(f.component_head) and (
                 f.component_head in p.lemmas or float(comp_emb[i] @ pemb[j]) >= 0.55)
             if self.records is not None:
-                self.records.append({"pid": pid, "feature": i, **sig, "pf": pf})
+                self.records.append({"pid": pid, "feature": i, **sig, "pf": pf,
+                                     "comp_found": int(comp_found)})
             ev = Evidence(prob, p.text, p.source, sig, comp_found, conflict)
             if (pid, i) not in best or ev.prob > best[(pid, i)].prob:
                 best[(pid, i)] = ev

@@ -45,6 +45,7 @@ class ClaimElements:
     # for dependent claims: the parent chain's elements, so the claim can be
     # judged as a whole (a dependent claim includes all of its parent's elements)
     inherited: list[str] = field(default_factory=list)
+    depth: int = 0          # 0 = independent, 1 = depends on an independent claim, ...
 
     @property
     def all_elements(self) -> list[str]:
@@ -103,4 +104,5 @@ def parse_claims(claims_text: str) -> list[ClaimElements]:
         if c.parent in by_num:
             p = by_num[c.parent]
             c.inherited = p.inherited + p.elements
+            c.depth = p.depth + 1
     return parsed

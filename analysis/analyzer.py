@@ -20,15 +20,21 @@ from analysis.elements import parse_claims
 from analysis.engine import judge_claim, judge_patent
 from analysis.extractor import ExtractedPatent
 from analysis.features import extract_feature
+from analysis.outcome_features import claim_info
 from retrieval.pipeline import PriorArtSearch
 from retrieval.sources import Query
 
 
 class Analyzer:
-    def __init__(self, search: PriorArtSearch | None = None, n_refs: int = 5):
+    def __init__(self, search: PriorArtSearch | None = None, n_refs: int = 5,
+                 outcome_model="auto"):
         self.search = search or PriorArtSearch()
         self.n_refs = n_refs
         self._checker = None
+        if outcome_model == "auto":
+            from analysis.outcome_model import OutcomePredictor
+            outcome_model = OutcomePredictor.load_if_available()
+        self.outcome_model = outcome_model
 
     @property
     def checker(self) -> DisclosureChecker:
@@ -51,13 +57,15 @@ class Analyzer:
 
     def analyze(self, doc: ExtractedPatent, before_date: str | None = None,
                 cpc_codes: list[str] | None = None, prior_art: dict | None = None,
-                prior_art_docs: dict | None = None, only_claims: list[int] | None = None) -> dict:
+                prior_art_docs: dict | None = None, only_claims: list[int] | None = None,
+                keep_inputs: bool = False) -> dict:
         """
         prior_art:      optional {claim_num | "all": [patent_ids]} to analyse against
                         given references (evaluation "oracle" mode) instead of searching
         prior_art_docs: {patent_id: {title, abstract, claims, description}} for
                         references that are not in the local index
         only_claims:    judge only these claim numbers (their parents are still parsed)
+        keep_inputs:    include each claim's raw outcome-model inputs (evaluation)
         """
         t0 = time.time()
         timing = {}
@@ -102,25 +110,43 @@ class Analyzer:
         timing["references_effects_s"] = round(time.time() - t, 1)
 
         t = time.time()
-        verdicts = []
+        verdicts, outcome_inputs = [], []
         for c in judged:
             fl = [feats[x] for x in c.all_elements]
             fe = np.stack([femb[x] for x in c.all_elements])
             ce = np.stack([cemb[x] for x in c.all_elements])
             pids = [p for p in refs.get(c.num, []) if p in docs]
+            self.checker.records = []           # raw signals for the outcome predictor
             evidence = self.checker.check(fl, fe, ce, pids) if pids else {}
             v = judge_claim(c.num, c.independent, fl, fe, evidence, effects, eemb, titles)
             v.parent = c.parent
             verdicts.append(v)
+            outcome_inputs.append({"signals": self.checker.records,
+                                   "info": claim_info(c, fl, len(v.linked_effects))})
+        self.checker.records = None
         timing["judging_s"] = round(time.time() - t, 1)
+
+        # examiner-outcome prediction: a separate learned model that reads the
+        # evidence above; it never changes the legal verdicts
+        predictions = [None] * len(verdicts)
+        if self.outcome_model is not None:
+            predictions = [self.outcome_model.predict(x["signals"], x["info"]) for x in outcome_inputs]
         timing["total_s"] = round(time.time() - t0, 1)
+
+        claims_out = []
+        for v, pred, inp in zip(verdicts, predictions, outcome_inputs):
+            d = {**v.to_dict(), "parent": getattr(v, "parent", None),
+                 "predicted_examiner_outcome": pred}
+            if keep_inputs:
+                d["outcome_inputs"] = inp
+            claims_out.append(d)
 
         return {
             "document": doc.to_dict(),
             "cpc": {"suggested": search["suggested_cpc"], "used": search["used_cpc"],
                     "filter_note": search["filter_note"]} if search else None,
             "patent": judge_patent(verdicts),
-            "claims": [{**v.to_dict(), "parent": getattr(v, "parent", None)} for v in verdicts],
+            "claims": claims_out,
             "effects": [e.to_dict() for e in effects],
             "references": {p: {"title": d["title"], "filing_date": d["filing_date"],
                                "publication_number": d["publication_number"]}
