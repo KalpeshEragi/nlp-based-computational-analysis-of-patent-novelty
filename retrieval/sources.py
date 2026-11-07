@@ -88,8 +88,11 @@ class LocalIndexSource(PriorArtSource):
     @property
     def encoder(self):
         if self._encoder is None:
+            import torch
             from sentence_transformers import SentenceTransformer
             self._encoder = SentenceTransformer(self.meta["embed_model"])
+            if torch.cuda.is_available():
+                self._encoder.half()  # fp16 on GPU: ~2x faster, same as index build
         return self._encoder
 
     def _encode(self, text: str, field: str) -> np.ndarray:
