@@ -78,6 +78,7 @@ class DisclosureChecker:
         if WEIGHTS_FILE.exists():
             self.weights.update(json.loads(WEIGHTS_FILE.read_text()))
         self._refs: dict[str, tuple[list[Passage], np.ndarray]] = {}
+        self.records: list | None = None   # set to [] to log raw signals (evaluation)
         self._nli_cache: dict[tuple[str, str], float] = {}
 
     # -- encoding -----------------------------------------------------------
@@ -94,6 +95,10 @@ class DisclosureChecker:
                     for e in c.elements]
         passages += [Passage(s, "abstract") for s in _sentences(doc.get("abstract", ""))]
         passages += [Passage(s, "summary") for s in _sentences(doc.get("summary", ""))]
+        desc = doc.get("description") or ""
+        if isinstance(desc, (list, tuple)):
+            desc = " ".join(map(str, desc))
+        passages += [Passage(s, "description") for s in _sentences(desc, 250)]
         if not passages:
             passages = [Passage(doc.get("title", "") or "(empty)", "title")]
         for p, d in zip(passages, _nlp().pipe(p.text for p in passages)):
@@ -142,15 +147,18 @@ class DisclosureChecker:
             gate = min(1.0, max(0.0, (sem - NLI_GATE_LO) / (NLI_GATE_HI - NLI_GATE_LO)))
             sig = {"nli": ent * gate, "sem": sem, "lex": lex, "syn": syn, "nli_raw": ent}
             prob = self._prob(sig)
-            conflict = False
+            conflict, pf = False, 1.0
             if f.params:  # numbers must agree when the feature is defined by them
                 same_unit = [q for q in p.params if any(q.unit == fp.unit for fp in f.params)]
                 if same_unit and not any(fp.overlaps(q) for fp in f.params for q in same_unit):
-                    conflict, prob = True, prob * 0.2
+                    conflict, pf = True, 0.2
                 elif not same_unit:
-                    prob *= 0.5
+                    pf = 0.5
+            prob *= pf
             comp_found = bool(f.component_head) and (
                 f.component_head in p.lemmas or float(comp_emb[i] @ pemb[j]) >= 0.55)
+            if self.records is not None:
+                self.records.append({"pid": pid, "feature": i, **sig, "pf": pf})
             ev = Evidence(prob, p.text, p.source, sig, comp_found, conflict)
             if (pid, i) not in best or ev.prob > best[(pid, i)].prob:
                 best[(pid, i)] = ev

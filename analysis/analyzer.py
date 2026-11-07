@@ -50,11 +50,14 @@ class Analyzer:
         return out
 
     def analyze(self, doc: ExtractedPatent, before_date: str | None = None,
-                cpc_codes: list[str] | None = None, prior_art: dict | None = None) -> dict:
+                cpc_codes: list[str] | None = None, prior_art: dict | None = None,
+                prior_art_docs: dict | None = None, only_claims: list[int] | None = None) -> dict:
         """
-        prior_art: optional {claim_num: [patent_ids]} to analyse against given
-        references (evaluation "oracle" mode, e.g. examiner citations) instead
-        of searching.
+        prior_art:      optional {claim_num | "all": [patent_ids]} to analyse against
+                        given references (evaluation "oracle" mode) instead of searching
+        prior_art_docs: {patent_id: {title, abstract, claims, description}} for
+                        references that are not in the local index
+        only_claims:    judge only these claim numbers (their parents are still parsed)
         """
         t0 = time.time()
         timing = {}
@@ -74,7 +77,8 @@ class Analyzer:
 
         # features (each unique element once)
         t = time.time()
-        texts = list(dict.fromkeys(e for c in claims for e in c.all_elements))
+        judged = [c for c in claims if not only_claims or c.num in only_claims]
+        texts = list(dict.fromkeys(e for c in judged for e in c.all_elements))
         feats = {x: extract_feature(x) for x in texts}
         femb = dict(zip(texts, self.checker.encode(texts)))
         comps = [feats[x].component or x for x in texts]
@@ -84,7 +88,10 @@ class Analyzer:
         # references
         t = time.time()
         all_pids = list(dict.fromkeys(p for v in refs.values() for p in v))
-        docs = self.search.source.get_documents(all_pids)
+        local = [p for p in all_pids if not prior_art_docs or p not in prior_art_docs]
+        docs = self.search.source.get_documents(local) if local else {}
+        docs.update({p: {"filing_date": "", "publication_number": p, "summary": "", **d}
+                     for p, d in (prior_art_docs or {}).items() if p in all_pids})
         for pid in all_pids:
             if pid in docs:
                 self.checker.load_reference(pid, docs[pid])
@@ -96,7 +103,7 @@ class Analyzer:
 
         t = time.time()
         verdicts = []
-        for c in claims:
+        for c in judged:
             fl = [feats[x] for x in c.all_elements]
             fe = np.stack([femb[x] for x in c.all_elements])
             ce = np.stack([cemb[x] for x in c.all_elements])

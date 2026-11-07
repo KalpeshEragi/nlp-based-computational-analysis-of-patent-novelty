@@ -6,3 +6,5 @@ cpc_classifier/model/
 cpc_classifier/model_v2test/
 retrieval/index/
 retrieval/index_small/
+eval/data/
+eval/results/

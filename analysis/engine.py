@@ -49,6 +49,28 @@ class ClaimVerdict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
 
+def decide(P: np.ndarray, threshold: float = THRESHOLD,
+           obv_threshold: float | None = None) -> tuple[str, float, float]:
+    """
+    Core decision on a refs x features matrix of P(disclosed).
+    Shared by judge_claim and the evaluation tuner so both use identical logic.
+    threshold      P needed for a feature to count as disclosed (anticipation)
+    obv_threshold  P needed for the combination check (defaults to threshold)
+    Returns (verdict, anticipation, combination).
+    """
+    if P.size == 0:
+        return "INVENTIVE", 0.0, 0.0
+    obv_threshold = threshold if obv_threshold is None else obv_threshold
+    covered = P >= threshold
+    c = max(range(P.shape[0]), key=lambda r: (covered[r].sum(), P[r].mean()))
+    anticipation, combination = float(P.min(axis=1).max()), float(P.max(axis=0).min())
+    if covered[c].all():
+        return "NOT_NOVEL", anticipation, combination
+    if (P >= obv_threshold).any(axis=0).all():
+        return "OBVIOUS", anticipation, combination
+    return "INVENTIVE", anticipation, combination
+
+
 def _label(ev) -> str:
     if ev.param_conflict:
         return "different parameter"

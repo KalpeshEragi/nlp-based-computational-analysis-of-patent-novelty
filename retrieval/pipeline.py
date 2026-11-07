@@ -18,8 +18,15 @@ class PriorArtSearch:
     def __init__(self, source: PriorArtSource | None = None,
                  predictor: CPCPredictor | None = None):
         self.source = source or LocalIndexSource("retrieval/index")
-        self.predictor = predictor or CPCPredictor("cpc_classifier/model_v2")
+        self._predictor = predictor
         self._matcher = None
+
+    @property
+    def predictor(self) -> CPCPredictor:
+        """Loaded on first use, so runs that skip Layer 1 never put it on the GPU."""
+        if self._predictor is None:
+            self._predictor = CPCPredictor("cpc_classifier/model_v2")
+        return self._predictor
 
     @property
     def matcher(self) -> ClaimMatcher:

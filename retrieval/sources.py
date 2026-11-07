@@ -70,19 +70,32 @@ class LocalIndexSource(PriorArtSource):
     def __init__(self, index_dir: str | Path = "retrieval/index", encoder=None):
         self.dir = Path(index_dir)
         self.meta = json.loads((self.dir / "meta.json").read_text())
-        self.df = pd.read_parquet(self.dir / "corpus.parquet")
-        self.emb = {f: np.load(self.dir / f"emb_{f}.npy").astype(np.float32)
-                    for f in WEIGHTS}
-        self.has_summary = np.load(self.dir / "has_summary.npy")
-        self.bm25 = bm25s.BM25.load(self.dir / "bm25")
-        self.dates = self.df["filing_date"].fillna("").to_numpy()
         self._encoder = encoder
+        self._loaded = False
 
+    def _load(self):
+        """Corpus, vectors and BM25 are loaded on first use (several GB of RAM)."""
+        if self._loaded:
+            return
+        self._df = pd.read_parquet(self.dir / "corpus.parquet")
+        # kept in float16 (as stored); only the rows being searched are upcast
+        self._emb = {f: np.load(self.dir / f"emb_{f}.npy") for f in WEIGHTS}
+        self._has_summary = np.load(self.dir / "has_summary.npy")
+        self._bm25 = bm25s.BM25.load(self.dir / "bm25")
+        self._dates = self._df["filing_date"].fillna("").to_numpy()
         # Layer 1 lookup: CPC subclass -> row numbers
-        self.cpc_rows: dict[str, list[int]] = {}
-        for i, subs in enumerate(self.df["subclasses"]):
+        self._cpc_rows: dict[str, list[int]] = {}
+        for i, subs in enumerate(self._df["subclasses"]):
             for s in subs:
-                self.cpc_rows.setdefault(s, []).append(i)
+                self._cpc_rows.setdefault(s, []).append(i)
+        self._loaded = True
+
+    df = property(lambda self: (self._load(), self._df)[1])
+    emb = property(lambda self: (self._load(), self._emb)[1])
+    has_summary = property(lambda self: (self._load(), self._has_summary)[1])
+    bm25 = property(lambda self: (self._load(), self._bm25)[1])
+    dates = property(lambda self: (self._load(), self._dates)[1])
+    cpc_rows = property(lambda self: (self._load(), self._cpc_rows)[1])
 
     # -- helpers -----------------------------------------------------------
     @property
@@ -90,9 +103,11 @@ class LocalIndexSource(PriorArtSource):
         if self._encoder is None:
             import torch
             from sentence_transformers import SentenceTransformer
-            self._encoder = SentenceTransformer(self.meta["embed_model"])
-            if torch.cuda.is_available():
-                self._encoder.half()  # fp16 on GPU: ~2x faster, same as index build
+            cuda = torch.cuda.is_available()
+            # load straight into fp16 on GPU (half the memory, ~2x faster)
+            self._encoder = SentenceTransformer(
+                self.meta["embed_model"],
+                model_kwargs={"torch_dtype": torch.float16} if cuda else None)
         return self._encoder
 
     def _encode(self, text: str, field: str) -> np.ndarray:
@@ -130,7 +145,7 @@ class LocalIndexSource(PriorArtSource):
         for f, w in WEIGHTS.items():
             if not q_text[f].strip():
                 continue
-            sims = self.emb[f][rows] @ self._encode(q_text[f], f)
+            sims = self.emb[f][rows].astype(np.float32) @ self._encode(q_text[f], f)
             weight = np.full(len(rows), w, np.float32)
             if f == "summary":
                 weight[~self.has_summary[rows]] = 0  # patent has no summary
