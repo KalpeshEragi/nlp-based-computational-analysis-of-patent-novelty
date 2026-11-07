@@ -123,9 +123,15 @@ def main():
 
     ds = Dataset.from_dict({"query": q, "passage": p, "label": y}).shuffle(seed=0)
     out = Path(args.out)
+    import math
+    import torch
+    n_dev = max(torch.cuda.device_count(), 1)
+    total_steps = math.ceil(len(ds) / (args.batch_size * n_dev)) * args.epochs
+    # warmup_ratio was removed in newer transformers; give 10% as steps
     targs = CrossEncoderTrainingArguments(
         output_dir=str(out / "ckpt"), num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size, learning_rate=args.lr, warmup_ratio=0.1,
+        per_device_train_batch_size=args.batch_size, learning_rate=args.lr,
+        warmup_steps=int(0.1 * total_steps),
         fp16=not args.smoke, logging_steps=200, save_strategy="no", report_to="none", seed=0)
     pos_weight = (1 - np.mean(y)) / max(np.mean(y), 1e-6)
     trainer = CrossEncoderTrainer(model=model, args=targs, train_dataset=ds,
