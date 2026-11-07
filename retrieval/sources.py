@@ -173,3 +173,9 @@ class LocalIndexSource(PriorArtSource):
     def get_claims(self, patent_ids: list[str]) -> dict[str, str]:
         sub = self.df[self.df["patent_id"].isin(set(patent_ids))]
         return dict(zip(sub["patent_id"], sub["claims"]))
+
+    def get_documents(self, patent_ids: list[str]) -> dict[str, dict]:
+        """Title, abstract, summary and claims: the disclosure the analysis checks against."""
+        sub = self.df[self.df["patent_id"].isin(set(patent_ids))]
+        cols = ["title", "abstract", "summary", "claims", "filing_date", "publication_number"]
+        return {r["patent_id"]: {c: r[c] for c in cols} for _, r in sub.iterrows()}
