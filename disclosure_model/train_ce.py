@@ -58,9 +58,8 @@ def clip(text: str, words: int) -> str:
     return " ".join(text.split()[:words])
 
 
-# The trainer's collator does not always truncate to max_length, and some
-# paragraphs are thousands of tokens (out of GPU memory). Clip the text first:
-# ~96 + 220 words stays within ~384 tokens.
+# Some paragraphs are thousands of tokens; clip the text first so a pair stays
+# near the 384-token limit (~96 + 220 words). The tokenizer also truncates.
 Q_WORDS, P_WORDS = 96, 220
 
 
@@ -75,13 +74,32 @@ def to_pairs(examples):
     return q, p, y
 
 
-def top1(model, examples) -> dict:
+class Scorer:
+    """Relevance scores for (query, paragraph) pairs from a 1-output classifier."""
+
+    def __init__(self, model, tok, max_length, device):
+        self.model, self.tok, self.max_length, self.device = model, tok, max_length, device
+
+    def __call__(self, pairs, batch_size=32):
+        import torch
+        self.model.eval()
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(pairs), batch_size):
+                q, p = zip(*pairs[i:i + batch_size])
+                enc = self.tok(list(q), list(p), truncation="longest_first",
+                               max_length=self.max_length, padding=True,
+                               return_tensors="pt").to(self.device)
+                with torch.autocast(self.device.type, enabled=self.device.type == "cuda"):
+                    out.extend(self.model(**enc).logits[:, 0].float().cpu().tolist())
+        return out
+
+
+def top1(score, examples) -> dict:
     hits, rr = [], []
     for e in examples:
         keys = list(e["options"])
-        s = model.predict([(clip(e["query"], Q_WORDS), clip(e["options"][k], P_WORDS)) for k in keys],
-                          batch_size=32,
-                          show_progress_bar=False)
+        s = score([(clip(e["query"], Q_WORDS), clip(e["options"][k], P_WORDS)) for k in keys])
         order = [keys[i] for i in np.argsort(-np.asarray(s))]
         hits.append(order[0] in e["gold"])
         rr.append(1 / (1 + min(order.index(g) for g in e["gold"])))
@@ -97,14 +115,16 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--max-length", type=int, default=384)
     ap.add_argument("--max-train", type=int, default=0)
+    ap.add_argument("--max-steps", type=int, default=0, help="stop early (smoke tests)")
     ap.add_argument("--smoke", action="store_true", help="train on a slice of PI4PC validation")
     ap.add_argument("--data-dir", default="hf_data")
     args = ap.parse_args()
 
-    from datasets import Dataset
-    from sentence_transformers.cross_encoder import (CrossEncoder, CrossEncoderTrainer,
-                                                     CrossEncoderTrainingArguments)
-    from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
+    import math
+    import torch
+    from torch import nn
+    from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
+                              get_linear_schedule_with_warmup)
 
     val_df = hf_parquet("PI4PC/validation.parquet", args.data_dir)
     noc_test = set(hf_parquet("NOC4PC/test.parquet", args.data_dir)["application_number"])
@@ -129,42 +149,62 @@ def main():
     q, p, y = to_pairs(train_ex)
     print(f"train examples {len(train_ex)} -> {len(y)} pairs ({np.mean(y):.2%} positive); val {len(val_ex)}")
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tok = AutoTokenizer.from_pretrained(args.backbone)
     # an NLI checkpoint has a 3-way head; replace it with a fresh 1-output relevance head
-    model = CrossEncoder(args.backbone, num_labels=1, max_length=args.max_length,
-                         model_kwargs={"ignore_mismatched_sizes": True})
-    model.tokenizer.model_max_length = args.max_length
-    base = top1(model, val_ex[:300])
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.backbone, num_labels=1, ignore_mismatched_sizes=True).to(device)
+    score = Scorer(model, tok, args.max_length, device)
+    base = top1(score, val_ex[:300])
     print("before training (val subset):", base, flush=True)
 
-    ds = Dataset.from_dict({"query": q, "passage": p, "label": y}).shuffle(seed=0)
-    out = Path(args.out)
-    import math
-    import torch
-    n_dev = max(torch.cuda.device_count(), 1)
-    # a T4 (15 GB) fits 16 pairs of 384 tokens; larger batches use gradient accumulation
-    per_device = min(args.batch_size, 16)
-    accum = max(1, args.batch_size // per_device)
-    total_steps = math.ceil(len(ds) / (per_device * accum * n_dev)) * args.epochs
-    print(f"per-device batch {per_device} x accumulation {accum} x {n_dev} GPU(s); ~{total_steps} steps")
-    # warmup_ratio was removed in newer transformers; give 10% as steps
-    targs = CrossEncoderTrainingArguments(
-        output_dir=str(out / "ckpt"), num_train_epochs=args.epochs,
-        per_device_train_batch_size=per_device, gradient_accumulation_steps=accum,
-        learning_rate=args.lr, warmup_steps=int(0.1 * total_steps),
-        fp16=not args.smoke, logging_steps=200, save_strategy="no", report_to="none", seed=0)
-    pos_weight = (1 - np.mean(y)) / max(np.mean(y), 1e-6)
-    trainer = CrossEncoderTrainer(model=model, args=targs, train_dataset=ds,
-                                  loss=BinaryCrossEntropyLoss(model, pos_weight=__import__("torch").tensor(pos_weight)))
-    trainer.train()
-    if torch.cuda.is_available():
+    order = np.random.default_rng(0).permutation(len(y))
+    bs = args.batch_size
+    steps = math.ceil(len(y) / bs) * args.epochs
+    if args.max_steps:
+        steps = min(steps, args.max_steps)
+    steps = int(steps)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    sched = get_linear_schedule_with_warmup(optim, int(0.1 * steps), steps)
+    pos_weight = torch.tensor((1 - np.mean(y)) / max(np.mean(y), 1e-6), device=device)
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    scaler = torch.amp.GradScaler(enabled=device.type == "cuda")
+    print(f"batch {bs}, {steps} steps on {device}", flush=True)
+
+    model.train()
+    running, t0 = 0.0, __import__("time").time()
+    for step in range(steps):
+        idx = order[(step * bs) % len(y):(step * bs) % len(y) + bs]
+        enc = tok([q[i] for i in idx], [p[i] for i in idx], truncation="longest_first",
+                  max_length=args.max_length, padding=True, return_tensors="pt").to(device)
+        target = torch.tensor([y[i] for i in idx], device=device)
+        with torch.autocast(device.type, enabled=device.type == "cuda"):
+            logits = model(**enc).logits[:, 0]
+        loss = loss_fn(logits.float(), target)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optim)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optim)
+        scaler.update()
+        optim.zero_grad(set_to_none=True)
+        sched.step()
+        running += loss.item()
+        if (step + 1) % 500 == 0:
+            print(f"step {step + 1}/{steps} loss {running / 500:.4f} "
+                  f"({__import__('time').time() - t0:.0f}s)", flush=True)
+            running = 0.0
+    if device.type == "cuda":
         print(f"peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.2f} GB", flush=True)
 
-    res = top1(model, val_ex)
+    res = top1(score, val_ex)
     print("after training (PI4PC validation, NOC4PC-test apps excluded):", res, flush=True)
-    model.save(str(out / "model"))
+    out = Path(args.out)
+    (out / "model").mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(out / "model")
+    tok.save_pretrained(out / "model")
     (out / "metrics.json").write_text(json.dumps(
         {"backbone": args.backbone, "args": vars(args), "before_subset": base, "validation": res,
-         "n_train_examples": len(train_ex), "n_pairs": len(y)}, indent=2))
+         "n_train_examples": len(train_ex), "n_pairs": len(y), "steps": steps}, indent=2))
     print("saved ->", out / "model")
 
 
