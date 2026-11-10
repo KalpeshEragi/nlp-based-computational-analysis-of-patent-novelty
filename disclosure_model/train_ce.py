@@ -54,13 +54,24 @@ def build_examples(df: pd.DataFrame) -> list[dict]:
     return out
 
 
+def clip(text: str, words: int) -> str:
+    return " ".join(text.split()[:words])
+
+
+# The trainer's collator does not always truncate to max_length, and some
+# paragraphs are thousands of tokens (out of GPU memory). Clip the text first:
+# ~96 + 220 words stays within ~384 tokens.
+Q_WORDS, P_WORDS = 96, 220
+
+
 def to_pairs(examples):
     q, p, y = [], [], []
     for e in examples:
         for k, text in e["options"].items():
             if k in e["silver"]:
                 continue
-            q.append(e["query"]); p.append(text); y.append(float(k in e["gold"]))
+            q.append(clip(e["query"], Q_WORDS)); p.append(clip(text, P_WORDS))
+            y.append(float(k in e["gold"]))
     return q, p, y
 
 
@@ -68,7 +79,8 @@ def top1(model, examples) -> dict:
     hits, rr = [], []
     for e in examples:
         keys = list(e["options"])
-        s = model.predict([(e["query"], e["options"][k]) for k in keys], batch_size=32,
+        s = model.predict([(clip(e["query"], Q_WORDS), clip(e["options"][k], P_WORDS)) for k in keys],
+                          batch_size=32,
                           show_progress_bar=False)
         order = [keys[i] for i in np.argsort(-np.asarray(s))]
         hits.append(order[0] in e["gold"])
@@ -120,6 +132,7 @@ def main():
     # an NLI checkpoint has a 3-way head; replace it with a fresh 1-output relevance head
     model = CrossEncoder(args.backbone, num_labels=1, max_length=args.max_length,
                          model_kwargs={"ignore_mismatched_sizes": True})
+    model.tokenizer.model_max_length = args.max_length
     base = top1(model, val_ex[:300])
     print("before training (val subset):", base, flush=True)
 
@@ -143,6 +156,8 @@ def main():
     trainer = CrossEncoderTrainer(model=model, args=targs, train_dataset=ds,
                                   loss=BinaryCrossEntropyLoss(model, pos_weight=__import__("torch").tensor(pos_weight)))
     trainer.train()
+    if torch.cuda.is_available():
+        print(f"peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.2f} GB", flush=True)
 
     res = top1(model, val_ex)
     print("after training (PI4PC validation, NOC4PC-test apps excluded):", res, flush=True)
