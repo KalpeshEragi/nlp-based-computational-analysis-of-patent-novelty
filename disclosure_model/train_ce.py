@@ -117,7 +117,9 @@ def main():
     q, p, y = to_pairs(train_ex)
     print(f"train examples {len(train_ex)} -> {len(y)} pairs ({np.mean(y):.2%} positive); val {len(val_ex)}")
 
-    model = CrossEncoder(args.backbone, num_labels=1, max_length=args.max_length)
+    # an NLI checkpoint has a 3-way head; replace it with a fresh 1-output relevance head
+    model = CrossEncoder(args.backbone, num_labels=1, max_length=args.max_length,
+                         model_kwargs={"ignore_mismatched_sizes": True})
     base = top1(model, val_ex[:300])
     print("before training (val subset):", base, flush=True)
 
@@ -126,12 +128,16 @@ def main():
     import math
     import torch
     n_dev = max(torch.cuda.device_count(), 1)
-    total_steps = math.ceil(len(ds) / (args.batch_size * n_dev)) * args.epochs
+    # a T4 (15 GB) fits 16 pairs of 384 tokens; larger batches use gradient accumulation
+    per_device = min(args.batch_size, 16)
+    accum = max(1, args.batch_size // per_device)
+    total_steps = math.ceil(len(ds) / (per_device * accum * n_dev)) * args.epochs
+    print(f"per-device batch {per_device} x accumulation {accum} x {n_dev} GPU(s); ~{total_steps} steps")
     # warmup_ratio was removed in newer transformers; give 10% as steps
     targs = CrossEncoderTrainingArguments(
         output_dir=str(out / "ckpt"), num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size, learning_rate=args.lr,
-        warmup_steps=int(0.1 * total_steps),
+        per_device_train_batch_size=per_device, gradient_accumulation_steps=accum,
+        learning_rate=args.lr, warmup_steps=int(0.1 * total_steps),
         fp16=not args.smoke, logging_steps=200, save_strategy="no", report_to="none", seed=0)
     pos_weight = (1 - np.mean(y)) / max(np.mean(y), 1e-6)
     trainer = CrossEncoderTrainer(model=model, args=targs, train_dataset=ds,
