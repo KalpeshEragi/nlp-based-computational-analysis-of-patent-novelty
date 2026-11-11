@@ -11,3 +11,4 @@ eval/results/
 analysis/outcome_model/
 out/
 hf_data/
+disclosure_model/ce_*/

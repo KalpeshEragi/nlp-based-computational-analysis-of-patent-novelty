@@ -15,7 +15,7 @@ import numpy as np
 from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
                              precision_recall_fscore_support, roc_auc_score)
 
-from analysis.disclosure import DEFAULT_WEIGHTS, NLI_GATE_HI, NLI_GATE_LO
+from analysis.disclosure import DEFAULT_WEIGHTS
 from analysis.engine import THRESHOLD, decide
 
 CLASSES = ["NOT_NOVEL", "OBVIOUS", "INVENTIVE"]
@@ -31,20 +31,19 @@ def _arrays(rec):
         sig = rec["signals"]
         pids = sorted({s["pid"] for s in sig})
         nf = rec["n_features"]
-        col = {k: np.array([s[k] for s in sig], np.float64) for k in ("sem", "nli_raw", "lex", "syn", "pf")}
+        col = {k: np.array([s[k] for s in sig], np.float64) for k in ("sem", "dis", "lex", "syn", "pf")}
         cell = np.array([pids.index(s["pid"]) * nf + s["feature"] for s in sig], int)
         rec["_arr"] = (col, cell, len(pids), nf)
     return rec["_arr"]
 
 
-def rescore(rec, w=None, threshold=THRESHOLD, gate=(NLI_GATE_LO, NLI_GATE_HI), obv_threshold=None):
+def rescore(rec, w=None, threshold=THRESHOLD, obv_threshold=None):
     """Verdict + scores for one claim from its raw signals."""
     w = w or DEFAULT_WEIGHTS
     col, cell, n_refs, nf = _arrays(rec)
     if n_refs == 0 or nf == 0:
         return decide(np.zeros((0, 0)), threshold, obv_threshold)
-    g = np.clip((col["sem"] - gate[0]) / (gate[1] - gate[0]), 0, 1)
-    z = w["bias"] + w["nli"] * col["nli_raw"] * g + w["sem"] * col["sem"] +         w["lex"] * col["lex"] + w["syn"] * col["syn"]
+    z = w["bias"] + w["dis"] * col["dis"] + w["sem"] * col["sem"] + w["lex"] * col["lex"] + w["syn"] * col["syn"]
     p = col["pf"] / (1 + np.exp(-z))
     best = np.zeros(n_refs * nf)
     np.maximum.at(best, cell, p)

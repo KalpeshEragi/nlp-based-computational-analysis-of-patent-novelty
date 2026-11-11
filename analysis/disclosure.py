@@ -7,7 +7,8 @@ For each (feature, reference) we take the reference's 3 most similar passages
     lexical    share of the feature's content words present in the passage
     syntactic  same component head noun / same function verb in the passage
     semantic   PatentSBERTa cosine similarity
-    entailment NLI model: does the passage *state* the feature? (not just topic)
+    disclosure patent-specific cross-encoder trained on examiner citations
+               (PANORAMA PI4PC): does this passage disclose this claim text?
 
 The signals are combined by a logistic model into P(disclosed). Weights start
 from sensible defaults and are re-fitted on examiner data by the evaluation.
@@ -28,10 +29,21 @@ import numpy as np
 from analysis.elements import parse_claims
 from analysis.features import Feature, _nlp, content_lemmas, extract_params
 
-NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
-DEFAULT_WEIGHTS = {"bias": -5.0, "nli": 4.0, "sem": 4.0, "lex": 2.0, "syn": 1.0}
+NLI_MODEL = "cross-encoder/nli-deberta-v3-base"          # only for advancement detection
+DISCLOSURE_MODEL = str(Path(__file__).resolve().parent.parent / "disclosure_model" / "ce_patentsberta")
+DEFAULT_WEIGHTS = {"bias": -4.0, "dis": 6.0, "sem": 2.0, "lex": 1.5, "syn": 0.5}
 WEIGHTS_FILE = Path(__file__).with_name("disclosure_weights.json")
-NLI_GATE_LO, NLI_GATE_HI = 0.45, 0.75   # semantic range over which NLI is trusted
+Q_WORDS, P_WORDS = 96, 220   # same clipping as the disclosure model's training
+
+
+def p_disclosed(s: dict, w: dict = DEFAULT_WEIGHTS) -> float:
+    """P(feature disclosed by a passage) from its raw signals (shared everywhere)."""
+    z = w["bias"] + w["dis"] * s["dis"] + w["sem"] * s["sem"] + w["lex"] * s["lex"] + w["syn"] * s["syn"]
+    return s.get("pf", 1.0) / (1 + math.exp(-z))
+
+
+def _clip(text: str, words: int) -> str:
+    return " ".join(text.split()[:words])
 
 
 @dataclass
@@ -63,16 +75,18 @@ def _sentences(text: str, max_n: int = 40) -> list[str]:
 
 
 class DisclosureChecker:
-    def __init__(self, encoder, nli_model: str = NLI_MODEL, top_passages: int = 3):
+    def __init__(self, encoder, disclosure_model: str = DISCLOSURE_MODEL,
+                 nli_model: str = NLI_MODEL, top_passages: int = 3):
         import torch
         from sentence_transformers import CrossEncoder
 
         self.encoder = encoder
-        self.nli = CrossEncoder(nli_model, max_length=256)
-        if torch.cuda.is_available():
-            self.nli.model.half()
-        labels = self.nli.model.config.id2label
-        self.ent_idx = next(i for i, l in labels.items() if l.lower() == "entailment")
+        self.cuda = torch.cuda.is_available()
+        self.dis_model = CrossEncoder(disclosure_model, num_labels=1, max_length=384)
+        if self.cuda:
+            self.dis_model.model.half()
+        self._nli_name, self._nli_model = nli_model, None
+        self._dis_cache: dict[tuple[str, str], float] = {}
         self.top_passages = top_passages
         self.weights = dict(DEFAULT_WEIGHTS)
         if WEIGHTS_FILE.exists():
@@ -80,6 +94,7 @@ class DisclosureChecker:
         self._refs: dict[str, tuple[list[Passage], np.ndarray]] = {}
         self.records: list | None = None   # set to [] to log raw signals (evaluation)
         self._nli_cache: dict[tuple[str, str], float] = {}
+        self.ent_idx = None
 
     # -- encoding -----------------------------------------------------------
     def encode(self, texts: list[str], max_len: int = 128) -> np.ndarray:
@@ -106,19 +121,36 @@ class DisclosureChecker:
         self._refs[pid] = (passages, self.encode([p.text for p in passages]))
 
     # -- scoring ------------------------------------------------------------
+    def _dis(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Disclosure-model probability for (claim text, passage) pairs, cached."""
+        todo = [p for p in dict.fromkeys(pairs) if p not in self._dis_cache]
+        if todo:
+            logits = self.dis_model.predict([(_clip(q, Q_WORDS), _clip(p, P_WORDS)) for q, p in todo],
+                                            batch_size=32, show_progress_bar=False)
+            for p, z in zip(todo, np.asarray(logits, dtype=float).reshape(-1)):
+                self._dis_cache[p] = float(1 / (1 + math.exp(-z)))
+        return [self._dis_cache[p] for p in pairs]
+
+    @property
+    def nli(self):
+        """General NLI model, used only to classify advancement sentences (effects.py)."""
+        if self._nli_model is None:
+            from sentence_transformers import CrossEncoder
+            self._nli_model = CrossEncoder(self._nli_name, max_length=256)
+            if self.cuda:
+                self._nli_model.model.half()
+            labels = self._nli_model.model.config.id2label
+            self.ent_idx = next(i for i, l in labels.items() if l.lower() == "entailment")
+        return self._nli_model
+
     def _nli(self, pairs: list[tuple[str, str]]) -> list[float]:
+        model = self.nli
         todo = [p for p in dict.fromkeys(pairs) if p not in self._nli_cache]
         if todo:
-            probs = self.nli.predict(todo, batch_size=32, apply_softmax=True,
-                                     show_progress_bar=False)
+            probs = model.predict(todo, batch_size=32, apply_softmax=True, show_progress_bar=False)
             for p, pr in zip(todo, probs):
                 self._nli_cache[p] = float(pr[self.ent_idx])
         return [self._nli_cache[p] for p in pairs]
-
-    def _prob(self, s: dict) -> float:
-        w = self.weights
-        z = w["bias"] + sum(w[k] * s[k] for k in ("nli", "sem", "lex", "syn"))
-        return 1 / (1 + math.exp(-z))
 
     def check(self, features: list[Feature], feat_emb: np.ndarray, comp_emb: np.ndarray,
               pids: list[str]) -> dict[str, list[Evidence]]:
@@ -132,21 +164,17 @@ class DisclosureChecker:
                 for j in np.argsort(-sims[i])[:k]:
                     jobs.append((pid, i, int(j), float(sims[i, j])))
 
-        # long fragments make the NLI model unreliable: use the first ~40 words
-        hyp = [" ".join(f.text.split()[:40]) for f in features]
-        nli = self._nli([(self._refs[pid][0][j].text, hyp[i]) for pid, i, j, _ in jobs])
+        dis = self._dis([(features[i].text, self._refs[pid][0][j].text) for pid, i, j, _ in jobs])
 
         best: dict[tuple[str, int], Evidence] = {}
-        for (pid, i, j, sem), ent in zip(jobs, nli):
+        for (pid, i, j, sem), d in zip(jobs, dis):
             f, (passages, pemb) = features[i], self._refs[pid]
             p = passages[j]
             lex = len(f.lemmas & p.lemmas) / max(len(f.lemmas), 1)
             syn = 0.5 * (f.component_head in p.lemmas) + \
                 0.5 * any(v in p.lemmas for v in f.function_verbs[:3])
-            # entailment only counts when the passage is on the same topic
-            gate = min(1.0, max(0.0, (sem - NLI_GATE_LO) / (NLI_GATE_HI - NLI_GATE_LO)))
-            sig = {"nli": ent * gate, "sem": sem, "lex": lex, "syn": syn, "nli_raw": ent}
-            prob = self._prob(sig)
+            sig = {"dis": d, "sem": sem, "lex": lex, "syn": syn}
+            prob = p_disclosed(sig, self.weights)
             conflict, pf = False, 1.0
             if f.params:  # numbers must agree when the feature is defined by them
                 same_unit = [q for q in p.params if any(q.unit == fp.unit for fp in f.params)]

@@ -20,7 +20,7 @@ from collections import defaultdict
 
 import numpy as np
 
-from analysis.disclosure import DEFAULT_WEIGHTS, NLI_GATE_HI, NLI_GATE_LO
+from analysis.disclosure import DEFAULT_WEIGHTS, p_disclosed
 
 FEATURE_NAMES = [
     # claim structure (7)
@@ -33,17 +33,14 @@ FEATURE_NAMES = [
     "closest_cov_30", "closest_cov_50", "closest_cov_70",
     "any_cov_30", "any_cov_50", "any_cov_70",
     # raw signals of each feature's best evidence (8)
-    "sem_mean", "sem_min", "nli_mean", "nli_min", "lex_mean", "lex_min", "syn_mean", "syn_min",
+    "sem_mean", "sem_min", "dis_mean", "dis_min", "lex_mean", "lex_min", "syn_mean", "syn_min",
     # evidence detail (4)
     "comp_found_frac", "param_conflicts", "linked_effects", "uncovered_any_50",
 ]
 
 
 def _p(s: dict, w=DEFAULT_WEIGHTS) -> float:
-    g = min(1.0, max(0.0, (s["sem"] - NLI_GATE_LO) / (NLI_GATE_HI - NLI_GATE_LO)))
-    z = w["bias"] + w["nli"] * s["nli_raw"] * g + w["sem"] * s["sem"] + \
-        w["lex"] * s["lex"] + w["syn"] * s["syn"]
-    return s["pf"] / (1 + math.exp(-z))
+    return p_disclosed(s, w)
 
 
 def build(signals: list[dict], info: dict) -> dict:
@@ -51,7 +48,7 @@ def build(signals: list[dict], info: dict) -> dict:
     nf = max(int(info.get("n_features", 0)), 1)
     pids = sorted({s["pid"] for s in signals})
     P = np.zeros((max(len(pids), 1), nf))
-    best = {k: np.zeros(nf) for k in ("sem", "nli_raw", "lex", "syn")}
+    best = {k: np.zeros(nf) for k in ("sem", "dis", "lex", "syn")}
     comp = np.zeros(nf)
     conflicts = set()
     for s in signals:
@@ -81,7 +78,7 @@ def build(signals: list[dict], info: dict) -> dict:
         "any_cov_30": float((anyP >= .3).mean()), "any_cov_50": float((anyP >= .5).mean()),
         "any_cov_70": float((anyP >= .7).mean()),
         "sem_mean": float(best["sem"].mean()), "sem_min": float(best["sem"].min()),
-        "nli_mean": float(best["nli_raw"].mean()), "nli_min": float(best["nli_raw"].min()),
+        "dis_mean": float(best["dis"].mean()), "dis_min": float(best["dis"].min()),
         "lex_mean": float(best["lex"].mean()), "lex_min": float(best["lex"].min()),
         "syn_mean": float(best["syn"].mean()), "syn_min": float(best["syn"].min()),
         "comp_found_frac": float(comp.mean()), "param_conflicts": len(conflicts),

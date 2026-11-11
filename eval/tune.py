@@ -31,7 +31,7 @@ def macro_f1(recs, w, t, t_obv):
 
 
 def sample(rng):
-    return ({"bias": rng.uniform(-9, -2), "nli": rng.uniform(0, 6), "sem": rng.uniform(1, 10),
+    return ({"bias": rng.uniform(-9, -2), "dis": rng.uniform(0, 10), "sem": rng.uniform(1, 10),
              "lex": rng.uniform(0, 5), "syn": rng.uniform(0, 3)},
             rng.uniform(0.3, 0.95), rng.uniform(0.2, 0.9))
 

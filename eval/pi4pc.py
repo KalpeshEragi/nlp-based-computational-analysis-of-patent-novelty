@@ -23,7 +23,11 @@ import pandas as pd
 
 from analysis.elements import parse_claims
 from analysis.features import extract_feature
-from analysis.disclosure import DEFAULT_WEIGHTS, NLI_GATE_HI, NLI_GATE_LO, _nlp, content_lemmas
+from analysis.disclosure import _nlp, content_lemmas
+
+# the previous (general NLI) disclosure formula, kept to benchmark against
+LEGACY_W = {"bias": -5.0, "nli": 4.0, "sem": 4.0, "lex": 2.0, "syn": 1.0}
+NLI_GATE_LO, NLI_GATE_HI = 0.45, 0.75
 
 DATA = Path("eval/data")
 
@@ -94,8 +98,8 @@ class Scorers:
         return self.nli._nli([(p, hyp) for p in paras])
 
     def current(self, r, paras):
-        """The engine's P(disclosed) formula at claim level (own elements, max over passage)."""
-        w = DEFAULT_WEIGHTS
+        """The previous P(disclosed) formula (general NLI) at claim level."""
+        w = LEGACY_W
         q = self.enc([r["own"]])[0]
         P = self.enc(paras)
         sem = P @ q
@@ -110,8 +114,10 @@ class Scorers:
         return 1 / (1 + np.exp(-z))
 
     def ce(self, r, paras):
-        return self._ce.predict([(r["own"], p) for p in paras], batch_size=16,
-                                show_progress_bar=False)
+        # same clipping as training (disclosure_model/train_ce.py)
+        from disclosure_model.train_ce import P_WORDS, Q_WORDS, clip
+        return self._ce.predict([(clip(r["own"], Q_WORDS), clip(p, P_WORDS)) for p in paras],
+                                batch_size=16, show_progress_bar=False)
 
 
 def main():
