@@ -280,10 +280,35 @@ PatentSBERTa was chosen: same quality, smaller and ~1.5× faster on CPU.
 It replaces the general NLI signal inside P(disclosed); NLI is kept only for
 advancement sentences.
 
-### Recalibration (in progress)
+### Recalibration with the new model (validation only)
 Validation signals were regenerated with the new model (7,392 claims, 0 errors);
-rule thresholds and the outcome model are being re-tuned on validation only.
-Results will be added here.
+rule weights/thresholds and the outcome model were re-tuned with grouped CV.
+
+**Legal analysis — features found in the examiner's own reference:**
+
+| Examiner outcome | Features found (old → new) | All features found (old → new) |
+|---|---|---|
+| §102 (one reference discloses everything) | 15.8% → **49.4%** | 0.7% → **15.1%** |
+| §103 | 25.4% → 53.9% | 10.5% → 21.4% |
+| Allowed | 22.3% → 50.8% | 7.6% → 20.9% |
+
+The engine now finds the features examiners point to about 3× more often, but
+coverage rises for all three outcomes alike: the examiner's cited art is the
+closest art in every case, and the difference between outcomes lies in details.
+
+**Outcome prediction — macro-F1, grouped CV on validation (leak-free):**
+
+| Model | General NLI signal | Trained disclosure model |
+|---|---|---|
+| Rule engine, tuned | 0.364 | 0.360 |
+| **Outcome model (LightGBM, 29 features, no `n_refs`)** | 0.492 | **0.517** |
+
+Out-of-fold per class (new): §102 F1 0.502, §103 0.585, allowed 0.464.
+
+**Live engine:** uses the tuned settings (`analysis/disclosure_weights.json`:
+P(disclosed) ≥ 0.708 counts as disclosed, ≥ 0.592 for the combination check).
+On the granted patent US9968239B2 the analysis moved from "13 × not novel"
+(untuned) to **6 inventive + 7 obvious → likely patentable**, matching the real grant.
 
 ---
 
