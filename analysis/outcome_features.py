@@ -6,7 +6,7 @@ These are computed FROM the legal analysis (feature chart + disclosure
 signals); they do not change it. The same function is used in evaluation and
 at runtime so the model always sees identical inputs.
 
-Groups (30 features):
+Groups (29 features):
   claim structure   breadth / dependency of the claim
   disclosure        anticipation / combination / coverage from P(disclosed)
   raw signals       lexical, syntactic, semantic, NLI of the best evidence
@@ -26,8 +26,8 @@ FEATURE_NAMES = [
     # claim structure (7)
     "n_features", "n_own_elements", "n_inherited", "is_independent", "depth",
     "claim_words", "n_params",
-    # references (1)
-    "n_refs",
+    # (n_refs is computed but NOT a model feature: in evaluation it is the
+    #  examiner's citation count, which leaks the outcome)
     # disclosure, from P(disclosed) with the engine's default weights (10)
     "anticipation", "combination", "mean_best_p", "closest_mean_p",
     "closest_cov_30", "closest_cov_50", "closest_cov_70",

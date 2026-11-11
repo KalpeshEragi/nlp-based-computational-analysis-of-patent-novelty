@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from retrieval.claims import independent_claims
+from retrieval.text_store import TextStore
 
 # Patent-level score weights (claims matter most: novelty is judged on claims)
 WEIGHTS = {"abstract": 0.3, "summary": 0.2, "claims": 0.5}
@@ -74,12 +75,18 @@ class LocalIndexSource(PriorArtSource):
         self._loaded = False
 
     def _load(self):
-        """Corpus, vectors and BM25 are loaded on first use (several GB of RAM)."""
+        """
+        Loaded on first use. Only light columns stay in memory; vectors are
+        memory-mapped and the long texts live in an on-disk SQLite store.
+        """
         if self._loaded:
             return
-        self._df = pd.read_parquet(self.dir / "corpus.parquet")
-        # kept in float16 (as stored); only the rows being searched are upcast
-        self._emb = {f: np.load(self.dir / f"emb_{f}.npy") for f in WEIGHTS}
+        self._df = pd.read_parquet(self.dir / "corpus.parquet",
+                                   columns=["patent_id", "title", "subclasses", "filing_date",
+                                            "publication_number"])
+        self._texts = TextStore(self.dir)
+        # memory-mapped float16 (as stored); only the rows being searched are read and upcast
+        self._emb = {f: np.load(self.dir / f"emb_{f}.npy", mmap_mode="r") for f in WEIGHTS}
         self._has_summary = np.load(self.dir / "has_summary.npy")
         self._bm25 = bm25s.BM25.load(self.dir / "bm25")
         self._dates = self._df["filing_date"].fillna("").to_numpy()
@@ -186,11 +193,11 @@ class LocalIndexSource(PriorArtSource):
         return out
 
     def get_claims(self, patent_ids: list[str]) -> dict[str, str]:
-        sub = self.df[self.df["patent_id"].isin(set(patent_ids))]
-        return dict(zip(sub["patent_id"], sub["claims"]))
+        self._load()
+        return {p: d["claims"] for p, d in self._texts.get(patent_ids, ["claims"]).items()}
 
     def get_documents(self, patent_ids: list[str]) -> dict[str, dict]:
         """Title, abstract, summary and claims: the disclosure the analysis checks against."""
-        sub = self.df[self.df["patent_id"].isin(set(patent_ids))]
+        self._load()
         cols = ["title", "abstract", "summary", "claims", "filing_date", "publication_number"]
-        return {r["patent_id"]: {c: r[c] for c in cols} for _, r in sub.iterrows()}
+        return self._texts.get(patent_ids, cols)

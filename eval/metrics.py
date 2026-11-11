@@ -37,7 +37,7 @@ def _arrays(rec):
     return rec["_arr"]
 
 
-def rescore(rec, w=None, threshold=THRESHOLD, obv_threshold=None):
+def rescore(rec, w=None, threshold=None, obv_threshold=None):
     """Verdict + scores for one claim from its raw signals."""
     w = w or DEFAULT_WEIGHTS
     col, cell, n_refs, nf = _arrays(rec)

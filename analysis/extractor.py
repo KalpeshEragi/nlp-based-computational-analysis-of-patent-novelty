@@ -43,6 +43,7 @@ class ExtractedPatent:
     claims: str = ""
     source: str = ""
     warnings: list[str] = field(default_factory=list)
+    priority_date: str = ""   # YYYYMMDD; prior art must be older than this
 
     @property
     def n_claims(self) -> int:
@@ -51,7 +52,8 @@ class ExtractedPatent:
     def to_dict(self) -> dict:
         return {"title": self.title, "abstract": self.abstract, "summary": self.summary,
                 "claims": self.claims, "n_claims": self.n_claims,
-                "source": self.source, "warnings": self.warnings}
+                "source": self.source, "warnings": self.warnings,
+                "priority_date": self.priority_date}
 
 
 # ----------------------------------------------------------------------------
@@ -281,8 +283,15 @@ def fetch_patent(number: str, timeout: int = 20) -> ExtractedPatent:
     summary = ""
     if desc:
         summary = split_sections(normalize(desc.get_text("\n"))).get("summary", "")
+    date = ""
+    for prop in ("priorityDate", "filingDate"):
+        el = soup.select_one(f"time[itemprop={prop}]")
+        if el and el.get("datetime"):
+            date = el["datetime"].replace("-", "")
+            break
     doc = ExtractedPatent(title=title, abstract=_clean_abstract(txt("section[itemprop=abstract]")),
-                          summary=summary, claims=" ".join(claims), source=number)
+                          summary=summary, claims=" ".join(claims), source=number,
+                          priority_date=date)
     for f in ("abstract", "claims"):
         if not getattr(doc, f):
             doc.warnings.append(f"{f} not found")

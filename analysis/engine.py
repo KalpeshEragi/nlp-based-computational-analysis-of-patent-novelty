@@ -26,7 +26,16 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-THRESHOLD = 0.5
+THRESHOLD = 0.5        # P(disclosed) needed for "disclosed" (anticipation)
+OBV_THRESHOLD = 0.5    # P needed in another reference for the combination check
+
+# tuned values from validation data (written by eval/train_outcome.py)
+from analysis.disclosure import WEIGHTS_FILE  # noqa: E402
+if WEIGHTS_FILE.exists():
+    import json as _json
+    _tuned = _json.loads(WEIGHTS_FILE.read_text())
+    THRESHOLD = _tuned.get("threshold", THRESHOLD)
+    OBV_THRESHOLD = _tuned.get("obv_threshold", OBV_THRESHOLD)
 EFFECT_LINK = 0.45     # cosine between an effect sentence and a feature
 EFFECT_BONUS = 0.1
 
@@ -49,7 +58,7 @@ class ClaimVerdict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
 
-def decide(P: np.ndarray, threshold: float = THRESHOLD,
+def decide(P: np.ndarray, threshold: float | None = None,
            obv_threshold: float | None = None) -> tuple[str, float, float]:
     """
     Core decision on a refs x features matrix of P(disclosed).
@@ -60,6 +69,8 @@ def decide(P: np.ndarray, threshold: float = THRESHOLD,
     """
     if P.size == 0:
         return "INVENTIVE", 0.0, 0.0
+    if threshold is None:
+        threshold, obv_threshold = THRESHOLD, OBV_THRESHOLD if obv_threshold is None else obv_threshold
     obv_threshold = threshold if obv_threshold is None else obv_threshold
     covered = P >= threshold
     c = max(range(P.shape[0]), key=lambda r: (covered[r].sum(), P[r].mean()))
@@ -110,7 +121,8 @@ def judge_claim(num, independent, features, feat_emb, evidence: dict, effects, e
 
     dist_idx = [i for i in range(len(features)) if not covered[c, i]]
     distinguishing = [{"feature": features[i].text, "label": _label(evidence[closest][i]),
-                       "found_in": [pids[r] for r in range(len(pids)) if r != c and covered[r, i]]}
+                       "found_in": [pids[r] for r in range(len(pids))
+                                    if r != c and P[r, i] >= OBV_THRESHOLD]}
                       for i in dist_idx]
 
     linked = []

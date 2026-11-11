@@ -24,6 +24,12 @@ from analysis.outcome_features import claim_info
 from retrieval.pipeline import PriorArtSearch
 from retrieval.sources import Query
 
+# speed/coverage presets. "fast" is meant for CPU-only hosting.
+MODES = {
+    "fast": {"k": 200, "layer3_patents": 80, "n_refs": 3},
+    "full": {"k": 500, "layer3_patents": 200, "n_refs": 5},
+}
+
 
 class Analyzer:
     def __init__(self, search: PriorArtSearch | None = None, n_refs: int = 5,
@@ -45,20 +51,29 @@ class Analyzer:
     def suggest_cpc(self, doc: ExtractedPatent, k: int = 5) -> list[dict]:
         return self.search.suggest_cpc(Query(doc.title, doc.abstract, doc.summary, doc.claims), k)
 
-    def _refs_per_claim(self, layer3: dict) -> dict[int, list[str]]:
+    def reset_caches(self):
+        """Drop per-analysis caches so a long-running server does not grow in memory."""
+        if self._checker is not None:
+            self._checker._refs.clear()
+            self._checker._dis_cache.clear()
+            self._checker._nli_cache.clear()
+        if self.search._matcher is not None:
+            self.search._matcher.clear_cache()
+
+    def _refs_per_claim(self, layer3: dict, n_refs: int | None = None) -> dict[int, list[str]]:
         """Top references for each claim: patents with the strongest claim matches."""
         out = {}
         for num, r in layer3["results"].items():
             score = defaultdict(float)
             for m in r["matches"][:30]:
                 score[m["patent_id"]] = max(score[m["patent_id"]], m["score"])
-            out[num] = sorted(score, key=score.get, reverse=True)[:self.n_refs]
+            out[num] = sorted(score, key=score.get, reverse=True)[:n_refs or self.n_refs]
         return out
 
     def analyze(self, doc: ExtractedPatent, before_date: str | None = None,
                 cpc_codes: list[str] | None = None, prior_art: dict | None = None,
                 prior_art_docs: dict | None = None, only_claims: list[int] | None = None,
-                keep_inputs: bool = False) -> dict:
+                keep_inputs: bool = False, mode: str = "full", progress=None) -> dict:
         """
         prior_art:      optional {claim_num | "all": [patent_ids]} to analyse against
                         given references (evaluation "oracle" mode) instead of searching
@@ -66,7 +81,11 @@ class Analyzer:
                         references that are not in the local index
         only_claims:    judge only these claim numbers (their parents are still parsed)
         keep_inputs:    include each claim's raw outcome-model inputs (evaluation)
+        mode:           "fast" or "full" (see MODES)
+        progress:       optional callback(stage: str, percent: int)
         """
+        report = progress or (lambda stage, pct: None)
+        settings = MODES[mode]
         t0 = time.time()
         timing = {}
         q = Query(title=doc.title, abstract=doc.abstract, summary=doc.summary, claims=doc.claims,
@@ -77,13 +96,15 @@ class Analyzer:
 
         search = None
         if prior_art is None:
-            search = self.search.run(q)
-            refs = self._refs_per_claim(search["claims"])
+            report("searching prior art", 5)
+            search = self.search.run(q, k=settings["k"], layer3_patents=settings["layer3_patents"])
+            refs = self._refs_per_claim(search["claims"], settings["n_refs"])
         else:
             refs = {c.num: list(prior_art.get(c.num, prior_art.get("all", []))) for c in claims}
         timing["search_s"] = round(time.time() - t0, 1)
 
         # features (each unique element once)
+        report("extracting claim features", 45)
         t = time.time()
         judged = [c for c in claims if not only_claims or c.num in only_claims]
         texts = list(dict.fromkeys(e for c in judged for e in c.all_elements))
@@ -94,6 +115,7 @@ class Analyzer:
         timing["features_s"] = round(time.time() - t, 1)
 
         # references
+        report("reading prior-art references", 55)
         t = time.time()
         all_pids = list(dict.fromkeys(p for v in refs.values() for p in v))
         local = [p for p in all_pids if not prior_art_docs or p not in prior_art_docs]
@@ -111,7 +133,8 @@ class Analyzer:
 
         t = time.time()
         verdicts, outcome_inputs = [], []
-        for c in judged:
+        for n, c in enumerate(judged):
+            report(f"judging claim {c.num} of {len(judged)}", 60 + int(35 * n / max(len(judged), 1)))
             fl = [feats[x] for x in c.all_elements]
             fe = np.stack([femb[x] for x in c.all_elements])
             ce = np.stack([cemb[x] for x in c.all_elements])
@@ -132,6 +155,7 @@ class Analyzer:
         if self.outcome_model is not None:
             predictions = [self.outcome_model.predict(x["signals"], x["info"]) for x in outcome_inputs]
         timing["total_s"] = round(time.time() - t0, 1)
+        report("done", 100)
 
         claims_out = []
         for v, pred, inp in zip(verdicts, predictions, outcome_inputs):

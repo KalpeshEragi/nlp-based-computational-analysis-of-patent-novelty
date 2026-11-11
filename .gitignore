@@ -13,3 +13,4 @@ out/
 hf_data/
 disclosure_model/ce_*/
 cpc_classifier/model_v2/
+analysis/outcome_model_v1_nli/
