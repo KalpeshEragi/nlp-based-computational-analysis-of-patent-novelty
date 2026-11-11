@@ -12,3 +12,4 @@ analysis/outcome_model/
 out/
 hf_data/
 disclosure_model/ce_*/
+cpc_classifier/model_v2/
